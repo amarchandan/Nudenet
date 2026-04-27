@@ -1,97 +1,70 @@
-**Looking for contributors/ maintainers for this repo**: 
-I have become busy with other stuff in the last years, still trying to maintain this repo as it is the current best OSS option for nudity detection,
-Looking for interested mainttainer, who can add/ work on more features for this repo (with my help of course)
+# NudeNet — Lightweight Nudity Detection
 
-# NudeNet: lightweight Nudity detection
+YOLOv8-based nudity detector & censor — runs fully on CPU via ONNX Runtime.
 
-https://nudenet.notai.tech/ in-browser demo (the detector is run client side, i.e: in your browser, images are not sent to a server)
+## Install
 
 ```bash
-pip install --upgrade "nudenet>=3.4.2"
+pip install nudenet
 ```
+
+## Quick start
 
 ```python
 from nudenet import NudeDetector
-detector = NudeDetector()
-# the 320n model included with the package will be used
 
-detector.detect('image.jpg') # Returns list of detections
+detector = NudeDetector()           # uses bundled 320n.onnx by default
 
-detector.detect_batch(['image_1.jpg', 'image_2.jpg']) # Returns list of [list of detections]
+# --- Single image ---
+detections = detector.detect("photo.jpg")
+# [{'class': 'BELLY_EXPOSED', 'score': 0.82, 'box': [64, 182, 49, 51]}, ...]
+
+# --- Batch ---
+results = detector.detect_batch(["a.jpg", "b.jpg"])
+
+# --- Censor (black box, blur, or pixelate) ---
+detector.censor("photo.jpg")                          # black box (default)
+detector.censor("photo.jpg", censor_style="blur")     # Gaussian blur
+detector.censor("photo.jpg", censor_style="pixel")    # pixelate / mosaic
+
+# --- Censor specific classes only ---
+detector.censor("photo.jpg", classes=["FACE_FEMALE", "FACE_MALE"])
+
+# --- Tune detection thresholds ---
+detector.detect("photo.jpg", score_threshold=0.4, nms_threshold=0.5)
 ```
 
-- [Python package example in colab](https://colab.research.google.com/drive/1WChIMZ9Yzseije3Oj-Ye-cGCMLw8azvZ?usp=sharing)
+## Accepted input types
 
-- `detect` and `detect_batch` accept file path(s), opencv image(s), image bytes(s), open(image_path, 'rb') (buffereader) objects
+All methods accept any of the following:
 
-#### Available models
+| Type | Example |
+|---|---|
+| `str` file path | `"photo.jpg"` |
+| `np.ndarray` (BGR) | `cv2.imread("photo.jpg")` |
+| `bytes` | `open("photo.jpg","rb").read()` |
+| `BufferedReader` | `open("photo.jpg","rb")` |
 
-| Model | resolution trained | based on | onnx link | pytorch link |
-| --- | --- | --- | --- | -- |
-| 320n | 320x320 | ultralytics yolov8n | [link](https://github.com/notAI-tech/NudeNet/releases/download/v3.4-weights/320n.onnx) | [link](https://github.com/notAI-tech/NudeNet/releases/download/v3.4-weights/320n.pt)
-| 640m | 640x640 | ultralytics yolov8m | [link](https://github.com/notAI-tech/NudeNet/releases/download/v3.4-weights/640m.onnx) | [link](https://github.com/notAI-tech/NudeNet/releases/download/v3.4-weights/640m.pt)
+## Models
+
+| Model | Resolution | Based on | ONNX |
+|---|---|---|---|
+| **320n** *(bundled)* | 320×320 | YOLOv8n | included |
+| 640m *(download)* | 640×640 | YOLOv8m | [link](https://github.com/notAI-tech/NudeNet/releases/download/v3.4-weights/640m.onnx) |
 
 ```python
-# To use the 640m model, download the onnx file and pass the path to the model_path argument
-
-detector = NudeDetector(model_path="downloaded_640m.onnx path", inference_resolution=640)
+# Use the larger 640m model
+detector = NudeDetector(model_path="640m.onnx", inference_resolution=640)
 ```
 
-- 320n is the default model and is included in the `nudenet` python package by default
-
+## All detectable labels
 
 ```python
-detection_example = [
- {'class': 'BELLY_EXPOSED',
-  'score': 0.799403190612793,
-  'box': [64, 182, 49, 51]},
- {'class': 'FACE_FEMALE',
-  'score': 0.7881264686584473,
-  'box': [82, 66, 36, 43]},
- ]
+from nudenet import LABELS
+print(LABELS)
+# ['FEMALE_GENITALIA_COVERED', 'FACE_FEMALE', 'BUTTOCKS_EXPOSED', ...]
 ```
 
-```python
-nude_detector.censor('image.jpg') # returns censored image output path
+## License
 
-# optional censor(self, image_path, classes=[], output_path=None) classes and output_path can be passed
-```
-
-```python
-all_labels = [
-    "FEMALE_GENITALIA_COVERED",
-    "FACE_FEMALE",
-    "BUTTOCKS_EXPOSED",
-    "FEMALE_BREAST_EXPOSED",
-    "FEMALE_GENITALIA_EXPOSED",
-    "MALE_BREAST_EXPOSED",
-    "ANUS_EXPOSED",
-    "FEET_EXPOSED",
-    "BELLY_COVERED",
-    "FEET_COVERED",
-    "ARMPITS_COVERED",
-    "ARMPITS_EXPOSED",
-    "FACE_MALE",
-    "BELLY_EXPOSED",
-    "MALE_GENITALIA_EXPOSED",
-    "ANUS_COVERED",
-    "FEMALE_BREAST_COVERED",
-    "BUTTOCKS_COVERED",
-]
-```
-
-
-### Docker
-
-```bash
-docker run -it -p8080:8080 ghcr.io/notai-tech/nudenet:latest
-```
-
-```bash
-curl -F f1=@"images.jpeg" "http://localhost:8080/infer"
-
-{"prediction": [[{"class": "BELLY_EXPOSED", "score": 0.8511635065078735, "box": [71, 182, 31, 50]}, {"class": "FACE_FEMALE", "score": 0.8033977150917053, "box": [83, 69, 21, 37]}, {"class": "FEMALE_BREAST_EXPOSED", "score": 0.7963727712631226, "box": [85, 137, 24, 38]}, {"class": "FEMALE_BREAST_EXPOSED", "score": 0.7709134817123413, "box": [63, 136, 20, 37]}, {"class": "ARMPITS_EXPOSED", "score": 0.7005534172058105, "box": [60, 127, 10, 20]}, {"class": "FEMALE_GENITALIA_EXPOSED", "score": 0.6804671287536621, "box": [81, 241, 14, 24]}]], "success": true}⏎
-```
-
-#### Some interesting projects based on NudeNet
-1 - by https://github.com/w-e-w, censor extension ps://github.com/notAI-tech/NudeNet/issues/131
+MIT
