@@ -1,21 +1,38 @@
-import os
+"""
+nudenet.nudenet
+~~~~~~~~~~~~~~~
+
+Core detection and censoring logic built on top of a YOLOv8-based ONNX model.
+
+Fixes over original v3.4.2
+---------------------------
+* _read_image: channel-aware conversion (grayscale / RGBA / BGR) instead of
+  blindly assuming RGBA for every image.
+* censor(): accepts all input types (str, ndarray, bytes, BufferedReader) via
+  the shared _load_mat() helper — was broken for non-string inputs.
+* detect_batch(): per-image output slicing now correctly handles both batched
+  (N, 84, 8400) and un-batched (84, 8400) ONNX output shapes.
+* score_threshold / nms_threshold are now user-configurable on every public
+  method instead of being hardcoded.
+* censor() supports three censor styles: 'black', 'blur', 'pixel'.
+* Meaningful exceptions and logging throughout instead of silent crashes.
+"""
+
 import _io
 import logging
+import os
+from typing import List, Optional, Union
+
 import cv2
 import numpy as np
 import onnxruntime
-from typing import List, Union, Optional
 
-# ---------------------------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Class labels
+# Class labels (fixed — same order as model output)
 # ---------------------------------------------------------------------------
-__labels = [
+LABELS: List[str] = [
     "FEMALE_GENITALIA_COVERED",
     "FACE_FEMALE",
     "BUTTOCKS_EXPOSED",
@@ -36,79 +53,71 @@ __labels = [
     "BUTTOCKS_COVERED",
 ]
 
+ImageInput = Union[str, np.ndarray, bytes, _io.BufferedReader]
+_DEFAULT_MODEL = os.path.join(os.path.dirname(__file__), "320n.onnx")
+
 
 # ---------------------------------------------------------------------------
-# FIX 1: _read_image — correct channel handling (was hardcoded RGBA2BGR)
+# Internal helpers
 # ---------------------------------------------------------------------------
-def _read_image(
-    image_path: Union[str, np.ndarray, bytes, _io.BufferedReader],
-    target_size: int = 320,
-):
-    """
-    Load an image from various input types and preprocess it for model inference.
 
-    Args:
-        image_path: File path (str), numpy array, raw bytes, or BufferedReader.
-        target_size: Model input resolution (default 320).
+def _load_mat(image_input: ImageInput) -> np.ndarray:
+    """Return a BGR uint8 ndarray from any supported image input."""
+    if isinstance(image_input, np.ndarray):
+        return image_input.copy()
 
-    Returns:
-        Tuple of (input_blob, x_ratio, y_ratio, x_pad, y_pad,
-                  image_original_width, image_original_height)
+    if isinstance(image_input, str):
+        if not os.path.isfile(image_input):
+            raise FileNotFoundError(f"Image not found: {image_input}")
+        mat = cv2.imread(image_input)
+        if mat is None:
+            raise ValueError(f"cv2 could not read: {image_input}")
+        return mat
 
-    Raises:
-        ValueError: If image_path type is unsupported or image cannot be loaded.
-    """
-    # --- Load raw mat ---
-    if isinstance(image_path, str):
-        if not os.path.isfile(image_path):
-            raise ValueError(f"Image file not found: {image_path}")
-        mat = cv2.imread(image_path)
-        if mat is None:
-            raise ValueError(f"cv2.imread failed to load image: {image_path}")
-    elif isinstance(image_path, np.ndarray):
-        mat = image_path.copy()
-    elif isinstance(image_path, bytes):
-        arr = np.frombuffer(image_path, np.uint8)
-        mat = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
-        if mat is None:
-            raise ValueError("Failed to decode image from bytes.")
-    elif isinstance(image_path, _io.BufferedReader):
-        arr = np.frombuffer(image_path.read(), np.uint8)
-        mat = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
-        if mat is None:
-            raise ValueError("Failed to decode image from BufferedReader.")
+    if isinstance(image_input, bytes):
+        buf = np.frombuffer(image_input, np.uint8)
+    elif isinstance(image_input, _io.BufferedReader):
+        buf = np.frombuffer(image_input.read(), np.uint8)
     else:
-        raise ValueError(
-            "image_path must be a str path, np.ndarray, bytes, or BufferedReader. "
-            f"Got: {type(image_path)}"
+        raise TypeError(
+            f"Unsupported type {type(image_input).__name__}. "
+            "Expected str, np.ndarray, bytes, or BufferedReader."
         )
 
-    if mat is None or mat.size == 0:
-        raise ValueError("Loaded image is empty or invalid.")
+    mat = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    if mat is None:
+        raise ValueError("Failed to decode image from buffer.")
+    return mat
 
-    image_original_height, image_original_width = mat.shape[:2]
 
-    # FIX 1: Handle channels correctly instead of blindly assuming RGBA
-    if mat.ndim == 2:
-        # Grayscale → BGR
-        mat_c3 = cv2.cvtColor(mat, cv2.COLOR_GRAY2BGR)
-    elif mat.shape[2] == 4:
-        # RGBA → BGR
-        mat_c3 = cv2.cvtColor(mat, cv2.COLOR_RGBA2BGR)
-    else:
-        # Already BGR (3-channel) — most JPEG/PNG images
-        mat_c3 = mat
+def _read_image(image_input: ImageInput, target_size: int = 320):
+    """
+    Load and preprocess one image for ONNX inference.
 
-    # --- Letterbox padding to make image square ---
-    max_size = max(mat_c3.shape[:2])
-    x_pad = max_size - mat_c3.shape[1]
-    x_ratio = max_size / mat_c3.shape[1]
-    y_pad = max_size - mat_c3.shape[0]
-    y_ratio = max_size / mat_c3.shape[0]
+    Returns
+    -------
+    (input_blob, x_ratio, y_ratio, x_pad, y_pad, orig_w, orig_h)
+    """
+    mat = _load_mat(image_input)
 
-    mat_pad = cv2.copyMakeBorder(mat_c3, 0, y_pad, 0, x_pad, cv2.BORDER_CONSTANT)
+    orig_h, orig_w = mat.shape[:2]
 
-    input_blob = cv2.dnn.blobFromImage(
+    # FIX: channel-aware colour conversion
+    if mat.ndim == 2:                          # grayscale
+        mat = cv2.cvtColor(mat, cv2.COLOR_GRAY2BGR)
+    elif mat.shape[2] == 4:                    # RGBA / BGRA
+        mat = cv2.cvtColor(mat, cv2.COLOR_BGRA2BGR)
+    # else already BGR — nothing to do
+
+    max_side = max(mat.shape[:2])
+    x_pad = max_side - mat.shape[1]
+    y_pad = max_side - mat.shape[0]
+    x_ratio = max_side / mat.shape[1]
+    y_ratio = max_side / mat.shape[0]
+
+    mat_pad = cv2.copyMakeBorder(mat, 0, y_pad, 0, x_pad, cv2.BORDER_CONSTANT)
+
+    blob = cv2.dnn.blobFromImage(
         mat_pad,
         1 / 255.0,
         (target_size, target_size),
@@ -116,288 +125,218 @@ def _read_image(
         swapRB=True,
         crop=False,
     )
-
-    return (
-        input_blob,
-        x_ratio,
-        y_ratio,
-        x_pad,
-        y_pad,
-        image_original_width,
-        image_original_height,
-    )
+    return blob, x_ratio, y_ratio, x_pad, y_pad, orig_w, orig_h
 
 
-# ---------------------------------------------------------------------------
-# FIX 2: _postprocess — user-configurable NMS thresholds
-# ---------------------------------------------------------------------------
 def _postprocess(
-    output,
+    raw_output,
     x_pad: int,
     y_pad: int,
     x_ratio: float,
     y_ratio: float,
-    image_original_width: int,
-    image_original_height: int,
-    model_width: int,
-    model_height: int,
-    score_threshold: float = 0.25,
-    nms_threshold: float = 0.45,
+    orig_w: int,
+    orig_h: int,
+    model_w: int,
+    model_h: int,
+    score_threshold: float,
+    nms_threshold: float,
 ) -> List[dict]:
     """
-    Convert raw ONNX model output into bounding box detections.
+    Convert raw ONNX output into a list of detection dicts.
 
-    Args:
-        output: Raw ONNX model output list.
-        score_threshold: Minimum confidence to keep a detection.
-        nms_threshold: IoU threshold for Non-Maximum Suppression.
-
-    Returns:
-        List of dicts with keys 'class', 'score', 'box'.
+    Handles both batched  (1, 84, 8400) and un-batched (84, 8400) shapes.
     """
-    # FIX 3: Safe squeeze — handles both batched (N,84,8400) and single (84,8400) outputs
-    raw = output[0]
-    if raw.ndim == 3:
-        raw = raw[0]  # take first item if batch dim present
-    outputs = np.transpose(raw)
+    arr = raw_output[0]
+    if arr.ndim == 3:        # (batch, channels, anchors) → drop batch dim
+        arr = arr[0]
+    outputs = np.transpose(arr)   # (anchors, channels)
 
-    rows = outputs.shape[0]
     boxes, scores, class_ids = [], [], []
 
-    for i in range(rows):
-        classes_scores = outputs[i][4:]
-        max_score = float(np.amax(classes_scores))
+    for row in outputs:
+        class_scores = row[4:]
+        max_score = float(class_scores.max())
+        if max_score < score_threshold:
+            continue
 
-        if max_score >= score_threshold:
-            class_id = int(np.argmax(classes_scores))
-            x, y, w, h = outputs[i][0:4]
+        class_id = int(class_scores.argmax())
+        cx, cy, w, h = row[:4]
 
-            # Center → top-left
-            x = x - w / 2
-            y = y - h / 2
+        # centre → top-left, then scale to padded space
+        x = (cx - w / 2) * (orig_w + x_pad) / model_w
+        y = (cy - h / 2) * (orig_h + y_pad) / model_h
+        w = w * (orig_w + x_pad) / model_w
+        h = h * (orig_h + y_pad) / model_h
 
-            # Scale to padded image space
-            x = x * (image_original_width + x_pad) / model_width
-            y = y * (image_original_height + y_pad) / model_height
-            w = w * (image_original_width + x_pad) / model_width
-            h = h * (image_original_height + y_pad) / model_height
+        # clip to image
+        x = float(np.clip(x, 0, orig_w))
+        y = float(np.clip(y, 0, orig_h))
+        w = float(np.clip(w, 0, orig_w - x))
+        h = float(np.clip(h, 0, orig_h - y))
 
-            # Clip to image boundaries
-            x = max(0.0, min(x, float(image_original_width)))
-            y = max(0.0, min(y, float(image_original_height)))
-            w = min(w, float(image_original_width) - x)
-            h = min(h, float(image_original_height) - y)
-
-            class_ids.append(class_id)
-            scores.append(max_score)
-            boxes.append([x, y, w, h])
+        boxes.append([x, y, w, h])
+        scores.append(max_score)
+        class_ids.append(class_id)
 
     if not boxes:
         return []
 
-    indices = cv2.dnn.NMSBoxes(boxes, scores, score_threshold, nms_threshold)
-
-    detections = []
-    for i in indices:
-        box = boxes[i]
-        x, y, w, h = box
-        detections.append(
-            {
-                "class": __labels[class_ids[i]],
-                "score": float(scores[i]),
-                "box": [int(x), int(y), int(w), int(h)],
-            }
-        )
-
-    return detections
+    keep = cv2.dnn.NMSBoxes(boxes, scores, score_threshold, nms_threshold)
+    return [
+        {
+            "class": LABELS[class_ids[i]],
+            "score": round(float(scores[i]), 6),
+            "box": [int(v) for v in boxes[i]],
+        }
+        for i in keep
+    ]
 
 
 # ---------------------------------------------------------------------------
-# Helper: load image as numpy array from any supported input type
+# Public API
 # ---------------------------------------------------------------------------
-def _load_mat(image_input: Union[str, np.ndarray, bytes, _io.BufferedReader]) -> np.ndarray:
-    """
-    Load image as a BGR numpy array from any supported input type.
-    Used by censor() to support all input types, not just file paths.
-    """
-    if isinstance(image_input, np.ndarray):
-        return image_input.copy()
-    elif isinstance(image_input, str):
-        if not os.path.isfile(image_input):
-            raise ValueError(f"Image file not found: {image_input}")
-        mat = cv2.imread(image_input)
-        if mat is None:
-            raise ValueError(f"cv2.imread failed: {image_input}")
-        return mat
-    elif isinstance(image_input, bytes):
-        arr = np.frombuffer(image_input, np.uint8)
-        mat = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if mat is None:
-            raise ValueError("Failed to decode image from bytes.")
-        return mat
-    elif isinstance(image_input, _io.BufferedReader):
-        arr = np.frombuffer(image_input.read(), np.uint8)
-        mat = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if mat is None:
-            raise ValueError("Failed to decode image from BufferedReader.")
-        return mat
-    else:
-        raise ValueError(f"Unsupported image input type: {type(image_input)}")
 
-
-# ---------------------------------------------------------------------------
-# Main class
-# ---------------------------------------------------------------------------
 class NudeDetector:
+    """
+    Lightweight nudity detector powered by a YOLOv8 ONNX model.
+
+    Parameters
+    ----------
+    model_path : str, optional
+        Path to a custom ``.onnx`` model file.
+        Defaults to the bundled ``320n.onnx``.
+    inference_resolution : int
+        Square input size fed to the model (default 320).
+        Use 640 together with the 640m model for higher accuracy.
+
+    Examples
+    --------
+    >>> from nudenet import NudeDetector
+    >>> detector = NudeDetector()
+    >>> detector.detect("photo.jpg")
+    [{'class': 'BELLY_EXPOSED', 'score': 0.82, 'box': [64, 182, 49, 51]}, ...]
+    >>> detector.censor("photo.jpg", censor_style="blur")
+    'photo_censored.jpg'
+    """
+
     def __init__(
         self,
         model_path: Optional[str] = None,
         inference_resolution: int = 320,
-    ):
-        """
-        Initialize the NudeDetector.
+    ) -> None:
+        resolved = model_path or _DEFAULT_MODEL
+        if not os.path.isfile(resolved):
+            raise FileNotFoundError(f"ONNX model not found: {resolved}")
 
-        Args:
-            model_path: Path to a custom ONNX model. Defaults to bundled 320n.onnx.
-            inference_resolution: Input resolution to use for inference (e.g. 320 or 640).
-        """
-        resolved_model = (
-            model_path
-            if model_path
-            else os.path.join(os.path.dirname(__file__), "320n.onnx")
-        )
-
-        if not os.path.isfile(resolved_model):
-            raise FileNotFoundError(f"ONNX model not found at: {resolved_model}")
-
-        logger.info(f"Loading model: {resolved_model} at resolution {inference_resolution}")
-
-        # CPU-only inference (no GPU)
-        self.onnx_session = onnxruntime.InferenceSession(
-            resolved_model,
+        logger.debug("Loading model %s at %dpx", resolved, inference_resolution)
+        self._session = onnxruntime.InferenceSession(
+            resolved,
             providers=["CPUExecutionProvider"],
         )
+        self._input_name: str = self._session.get_inputs()[0].name
+        self.input_width: int = inference_resolution
+        self.input_height: int = inference_resolution
 
-        model_inputs = self.onnx_session.get_inputs()
-        self.input_width = inference_resolution
-        self.input_height = inference_resolution
-        self.input_name = model_inputs[0].name
+    # ------------------------------------------------------------------
+    # Single-image detection
+    # ------------------------------------------------------------------
 
     def detect(
         self,
-        image_path: Union[str, np.ndarray, bytes, _io.BufferedReader],
+        image: ImageInput,
         score_threshold: float = 0.25,
         nms_threshold: float = 0.45,
     ) -> List[dict]:
         """
-        Detect nudity-related classes in a single image.
+        Detect nudity-related regions in a single image.
 
-        Args:
-            image_path: Image as file path, numpy array, bytes, or BufferedReader.
-            score_threshold: Minimum confidence score for a detection to be kept.
-            nms_threshold: IoU threshold for Non-Maximum Suppression.
+        Parameters
+        ----------
+        image :
+            File path, ``np.ndarray`` (BGR), ``bytes``, or ``BufferedReader``.
+        score_threshold :
+            Minimum confidence to keep a detection (default 0.25).
+        nms_threshold :
+            IoU overlap threshold for Non-Maximum Suppression (default 0.45).
 
-        Returns:
-            List of dicts: [{'class': str, 'score': float, 'box': [x, y, w, h]}, ...]
+        Returns
+        -------
+        list of dict
+            ``[{'class': str, 'score': float, 'box': [x, y, w, h]}, ...]``
         """
-        (
-            preprocessed_image,
-            x_ratio,
-            y_ratio,
-            x_pad,
-            y_pad,
-            image_original_width,
-            image_original_height,
-        ) = _read_image(image_path, self.input_width)
-
-        outputs = self.onnx_session.run(None, {self.input_name: preprocessed_image})
-
-        return _postprocess(
-            outputs,
-            x_pad,
-            y_pad,
-            x_ratio,
-            y_ratio,
-            image_original_width,
-            image_original_height,
-            self.input_width,
-            self.input_height,
-            score_threshold=score_threshold,
-            nms_threshold=nms_threshold,
+        blob, x_ratio, y_ratio, x_pad, y_pad, orig_w, orig_h = _read_image(
+            image, self.input_width
         )
+        outputs = self._session.run(None, {self._input_name: blob})
+        return _postprocess(
+            outputs, x_pad, y_pad, x_ratio, y_ratio,
+            orig_w, orig_h, self.input_width, self.input_height,
+            score_threshold, nms_threshold,
+        )
+
+    # ------------------------------------------------------------------
+    # Batch detection
+    # ------------------------------------------------------------------
 
     def detect_batch(
         self,
-        image_paths: List[Union[str, np.ndarray, bytes, _io.BufferedReader]],
+        images: List[ImageInput],
         batch_size: int = 4,
         score_threshold: float = 0.25,
         nms_threshold: float = 0.45,
     ) -> List[List[dict]]:
         """
-        Perform batch detection on a list of images.
+        Detect nudity-related regions in multiple images efficiently.
 
-        Args:
-            image_paths: List of images (file paths, arrays, bytes, or BufferedReaders).
-            batch_size: Number of images per inference batch.
-            score_threshold: Minimum confidence score for detections.
-            nms_threshold: IoU threshold for Non-Maximum Suppression.
+        Parameters
+        ----------
+        images :
+            List of images (any supported input type).
+        batch_size :
+            Number of images processed per ONNX forward pass (default 4).
+        score_threshold :
+            Minimum confidence to keep a detection.
+        nms_threshold :
+            IoU threshold for Non-Maximum Suppression.
 
-        Returns:
-            List of detection lists, one per input image.
+        Returns
+        -------
+        list of list of dict
+            One detection list per input image, in the same order.
         """
-        all_detections = []
+        all_detections: List[List[dict]] = []
 
-        for i in range(0, len(image_paths), batch_size):
-            batch = image_paths[i: i + batch_size]
-            batch_inputs = []
-            batch_metadata = []
+        for start in range(0, len(images), batch_size):
+            chunk = images[start: start + batch_size]
+            blobs, metas = [], []
 
-            for image_path in batch:
-                (
-                    preprocessed_image,
-                    x_ratio,
-                    y_ratio,
-                    x_pad,
-                    y_pad,
-                    image_original_width,
-                    image_original_height,
-                ) = _read_image(image_path, self.input_width)
-                batch_inputs.append(preprocessed_image)
-                batch_metadata.append(
-                    (x_ratio, y_ratio, x_pad, y_pad, image_original_width, image_original_height)
-                )
+            for img in chunk:
+                blob, *meta = _read_image(img, self.input_width)
+                blobs.append(blob)
+                metas.append(meta)  # (x_ratio, y_ratio, x_pad, y_pad, orig_w, orig_h)
 
-            batch_input = np.vstack(batch_inputs)
-            outputs = self.onnx_session.run(None, {self.input_name: batch_input})
+            batch_blob = np.vstack(blobs)
+            outputs = self._session.run(None, {self._input_name: batch_blob})
 
-            # FIX 3: Correct per-image output slicing for batch
-            # outputs[0] shape: (batch_size, num_classes+4, num_anchors)
-            for j, metadata in enumerate(batch_metadata):
-                (x_ratio, y_ratio, x_pad, y_pad, image_original_width, image_original_height) = metadata
-
-                # Extract single image output and wrap in list to match _postprocess signature
-                single_output = [outputs[0][j: j + 1]]
-
+            for j, (x_ratio, y_ratio, x_pad, y_pad, orig_w, orig_h) in enumerate(metas):
+                # FIX: correct per-image slice from batched output
+                single = [outputs[0][j: j + 1]]
                 detections = _postprocess(
-                    single_output,
-                    x_pad,
-                    y_pad,
-                    x_ratio,
-                    y_ratio,
-                    image_original_width,
-                    image_original_height,
-                    self.input_width,
-                    self.input_height,
-                    score_threshold=score_threshold,
-                    nms_threshold=nms_threshold,
+                    single, x_pad, y_pad, x_ratio, y_ratio,
+                    orig_w, orig_h, self.input_width, self.input_height,
+                    score_threshold, nms_threshold,
                 )
                 all_detections.append(detections)
 
         return all_detections
 
+    # ------------------------------------------------------------------
+    # Censoring
+    # ------------------------------------------------------------------
+
     def censor(
         self,
-        image_path: Union[str, np.ndarray, bytes, _io.BufferedReader],
+        image: ImageInput,
         classes: Optional[List[str]] = None,
         output_path: Optional[str] = None,
         censor_style: str = "black",
@@ -406,72 +345,87 @@ class NudeDetector:
         nms_threshold: float = 0.45,
     ) -> str:
         """
-        Detect and censor nudity-related regions in an image.
+        Detect and censor nudity-related regions, then save the result.
 
-        Args:
-            image_path: Image as file path, numpy array, bytes, or BufferedReader.
-            classes: List of class names to censor. Censors all detected classes if empty/None.
-            output_path: Where to save the censored image. Auto-generated if not provided.
-            censor_style: 'black' for black box, 'blur' for Gaussian blur, 'pixel' for pixelate.
-            blur_factor: Blur kernel size (used for 'blur' and 'pixel' styles). Must be odd.
-            score_threshold: Minimum confidence for detections.
-            nms_threshold: IoU threshold for Non-Maximum Suppression.
+        Parameters
+        ----------
+        image :
+            Input image — file path, ``np.ndarray``, ``bytes``, or
+            ``BufferedReader``.
+        classes :
+            Restrict censoring to these label strings.  ``None`` / ``[]``
+            censors everything that is detected.
+        output_path :
+            Destination file path.  Auto-generated when omitted.
+        censor_style :
+            ``'black'``  — solid black rectangle (default).
+            ``'blur'``   — Gaussian blur.
+            ``'pixel'``  — pixelate (mosaic).
+        blur_factor :
+            Kernel / block size used by ``'blur'`` and ``'pixel'`` styles.
+            Must be a positive integer (default 15).
+        score_threshold :
+            Minimum confidence for a detection to be censored.
+        nms_threshold :
+            IoU threshold for Non-Maximum Suppression.
 
-        Returns:
-            Path to the saved censored image.
+        Returns
+        -------
+        str
+            Absolute path to the saved censored image.
 
-        Raises:
-            ValueError: If image cannot be loaded, output_path is invalid, or style is unknown.
+        Raises
+        ------
+        ValueError
+            If ``censor_style`` is unrecognised or the image cannot be saved.
         """
-        detections = self.detect(image_path, score_threshold, nms_threshold)
+        if censor_style not in ("black", "blur", "pixel"):
+            raise ValueError(
+                f"Unknown censor_style '{censor_style}'. "
+                "Choose from: 'black', 'blur', 'pixel'."
+            )
 
+        detections = self.detect(image, score_threshold, nms_threshold)
         if classes:
             detections = [d for d in detections if d["class"] in classes]
 
-        # FIX 4: censor() now supports all input types, not just string paths
-        img = _load_mat(image_path)
+        # FIX: _load_mat() works for all input types, not just str paths
+        mat = _load_mat(image)
 
-        for detection in detections:
-            x, y, w, h = detection["box"]
-            # Ensure ROI is within image bounds
+        for det in detections:
+            x, y, w, h = det["box"]
             x1, y1 = max(0, x), max(0, y)
-            x2, y2 = min(img.shape[1], x + w), min(img.shape[0], y + h)
-            roi = img[y1:y2, x1:x2]
-
+            x2, y2 = min(mat.shape[1], x + w), min(mat.shape[0], y + h)
+            roi = mat[y1:y2, x1:x2]
             if roi.size == 0:
                 continue
 
             if censor_style == "black":
-                img[y1:y2, x1:x2] = 0
+                mat[y1:y2, x1:x2] = 0
 
             elif censor_style == "blur":
-                # Ensure kernel is odd and at least 1
-                k = max(1, blur_factor | 1)
-                img[y1:y2, x1:x2] = cv2.GaussianBlur(roi, (k, k), 0)
+                k = max(1, blur_factor | 1)        # ensure odd
+                mat[y1:y2, x1:x2] = cv2.GaussianBlur(roi, (k, k), 0)
 
-            elif censor_style == "pixel":
-                # Pixelate by downscaling then upscaling
-                small_h = max(1, (y2 - y1) // blur_factor)
-                small_w = max(1, (x2 - x1) // blur_factor)
-                small = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
-                img[y1:y2, x1:x2] = cv2.resize(small, (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST)
-
-            else:
-                raise ValueError(
-                    f"Unknown censor_style '{censor_style}'. Choose from: 'black', 'blur', 'pixel'."
+            else:  # pixel
+                factor = max(1, blur_factor)
+                sh = max(1, (y2 - y1) // factor)
+                sw = max(1, (x2 - x1) // factor)
+                small = cv2.resize(roi, (sw, sh), interpolation=cv2.INTER_LINEAR)
+                mat[y1:y2, x1:x2] = cv2.resize(
+                    small, (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST
                 )
 
         # Determine output path
         if not output_path:
-            if isinstance(image_path, str):
-                base, ext = os.path.splitext(image_path)
+            if isinstance(image, str):
+                base, ext = os.path.splitext(image)
                 output_path = f"{base}_censored{ext}"
             else:
                 output_path = "censored_output.jpg"
 
-        saved = cv2.imwrite(output_path, img)
-        if not saved:
-            raise ValueError(f"Failed to save censored image to: {output_path}")
+        if not cv2.imwrite(output_path, mat):
+            raise ValueError(f"Failed to write censored image to: {output_path}")
 
-        logger.info(f"Censored image saved to: {output_path}")
+        logger.debug("Censored image saved → %s", output_path)
         return output_path
