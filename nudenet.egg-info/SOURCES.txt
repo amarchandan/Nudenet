@@ -1,0 +1,14 @@
+LICENSE
+LICENSE.md
+MANIFEST.in
+README.md
+setup.py
+nudenet/320n.onnx
+nudenet/__init__.py
+nudenet/nudenet.py
+nudenet.egg-info/PKG-INFO
+nudenet.egg-info/SOURCES.txt
+nudenet.egg-info/dependency_links.txt
+nudenet.egg-info/entry_points.txt
+nudenet.egg-info/requires.txt
+nudenet.egg-info/top_level.txt
